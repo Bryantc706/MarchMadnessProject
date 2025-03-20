@@ -1,338 +1,444 @@
-import os
-import zipfile
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, StackingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, log_loss, roc_auc_score, confusion_matrix, classification_report, brier_score_loss
-import xgboost as xgb
-import lightgbm as lgb
-
-def extract_data(zip_file_path, extract_folder):
-    """Extract data from zip file to folder"""
-    # Create folder if not exists
-    if not os.path.exists(extract_folder):
-        os.makedirs(extract_folder)
-    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_folder)
-    print('Extracted files from ' + zip_file_path)
-
-def prepare_training_data(cleaned_folder):
-    """Prepare training data from raw files"""
-    print("Preparing training data from raw files...")
-    
-    # Paths for men's tournament results and teams
-    men_results_path = os.path.join(cleaned_folder, 'MNCAATourneyDetailedResults.csv')
-    men_teams_path = os.path.join(cleaned_folder, 'MTeams.csv')
-    
-    # Check if files exist
-    if not os.path.exists(men_results_path) or not os.path.exists(men_teams_path):
-        print(f"Required files not found. Checking contents of {cleaned_folder}:")
-        if os.path.exists(cleaned_folder):
-            print(os.listdir(cleaned_folder))
-        else:
-            print(f"{cleaned_folder} directory does not exist")
-        raise FileNotFoundError(f"Required files not found in {cleaned_folder}")
-    
-    # Load tournament results and teams
-    results_df = pd.read_csv(men_results_path)
-    teams_df = pd.read_csv(men_teams_path)
-    
-    # Create features for each game
-    print("Creating features for each game...")
-    
-    # Initialize an empty dataframe for training data
-    train_data = []
-    
-    # Process each game
-    for _, row in results_df.iterrows():
-        season = row['Season']
-        wteam = row['WTeamID']
-        lteam = row['LTeamID']
-        
-        # Determine higher and lower seed teams (using team ID as proxy if seed info not available)
-        higher_team = max(wteam, lteam)
-        lower_team = min(wteam, lteam)
-        
-        # Create features (simplified example - expand as needed)
-        features = {
-            'Season': season,
-            'HigherTeamID': higher_team,
-            'LowerTeamID': lower_team,
-            'Tournament': 1,  # 1 for tournament games
-            'ScoreDiff': abs(row['WScore'] - row['LScore']),
-            'TotalScore': row['WScore'] + row['LScore'],
-            'WLoc': 1 if row['WLoc'] == 'H' else (0 if row['WLoc'] == 'A' else 0.5),  # Home/Away/Neutral
-            'NumOT': row['NumOT'],
-            'WFGM': row['WFGM'],
-            'WFGA': row['WFGA'],
-            'WFGM3': row['WFGM3'],
-            'WFGA3': row['WFGA3'],
-            'WFTM': row['WFTM'],
-            'WFTA': row['WFTA'],
-            'WOR': row['WOR'],
-            'WDR': row['WDR'],
-            'WAst': row['WAst'],
-            'WTO': row['WTO'],
-            'WStl': row['WStl'],
-            'WBlk': row['WBlk'],
-            'WPF': row['WPF'],
-            'LFGM': row['LFGM'],
-            'LFGA': row['LFGA'],
-            'LFGM3': row['LFGM3'],
-            'LFGA3': row['LFGA3'],
-            'LFTM': row['LFTM'],
-            'LFTA': row['LFTA'],
-            'LOR': row['LOR'],
-            'LDR': row['LDR'],
-            'LAst': row['LAst'],
-            'LTO': row['LTO'],
-            'LStl': row['LStl'],
-            'LBlk': row['LBlk'],
-            'LPF': row['LPF'],
-            'Target': 1 if wteam == higher_team else 0  # 1 if higher seed team won, 0 otherwise
-        }
-        
-        train_data.append(features)
-    
-    # Convert to dataframe
-    train_df = pd.DataFrame(train_data)
-    
-    # Save the prepared data
-    train_file = os.path.join(cleaned_folder, 'train_data_enhanced.csv')
-    train_df.to_csv(train_file, index=False)
-    print(f"Training data saved to {train_file}")
-    
-    return train_df
-
-def load_and_prepare_data(cleaned_folder):
-    """Load and prepare data for training"""
-    # Try to load the preprocessed file
-    train_file = os.path.join(cleaned_folder, 'train_data_enhanced.csv')
-    
-    if os.path.exists(train_file):
-        print(f"Loading preprocessed training data from {train_file}")
-        df = pd.read_csv(train_file)
-    else:
-        print(f"Preprocessed file {train_file} not found. Preparing from raw data...")
-        df = prepare_training_data(cleaned_folder)
-    
-    # Create features and target
-    X = df.drop(columns=['Season', 'LowerTeamID', 'HigherTeamID', 'Tournament', 'Target'])
-    y = df['Target']
-    return X, y
-
-def train_model(X_train, y_train):
-    """Train a stacking ensemble model"""
-    print("Training stacking ensemble model...")
-    # Define base models
-    estimators = [
-        ('gb', GradientBoostingClassifier(random_state=42)),
-        ('rf', RandomForestClassifier(random_state=42)),
-        ('xgb', xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss')),
-        ('lgb', lgb.LGBMClassifier(random_state=42))
-    ]
-    
-    # Define meta-model
-    meta_model = LogisticRegression(max_iter=1000, random_state=42)
-    
-    # Create Stacking ensemble
-    stack_model = StackingClassifier(estimators=estimators, final_estimator=meta_model, cv=5, passthrough=False)
-    
-    # Train the stacking model
-    stack_model.fit(X_train, y_train)
-    print("Model training complete")
-    
-    return stack_model
-
-def evaluate_model(model, X_test, y_test):
-    """Evaluate the model on test data"""
-    print("Evaluating model on test data...")
-    # Predict on test set
-    pred_proba = model.predict_proba(X_test)[:, 1]
-    pred = model.predict(X_test)
-    
-    # Evaluate the model
-    acc = accuracy_score(y_test, pred)
-    ll = log_loss(y_test, pred_proba)
-    roc = roc_auc_score(y_test, pred_proba)
-    gini = 2 * roc - 1
-    brier = brier_score_loss(y_test, pred_proba)
-    
-    print('--- Enhanced Stacking Ensemble Evaluation ---')
-    print('Accuracy:', acc)
-    print('Log Loss:', ll)
-    print('ROC AUC:', roc)
-    print('Gini Coefficient:', gini)
-    print('Brier Score:', brier)
-    print('Confusion Matrix:\n', confusion_matrix(y_test, pred))
-    print('Classification Report:\n', classification_report(y_test, pred))
-
-def prepare_test_data(cleaned_folder, sample_submission):
-    """Prepare test data from sample submission IDs"""
-    print("Preparing test data from sample submission IDs...")
-    
-    # Extract information from sample submission IDs
-    # Format is assumed to be: {Season}{Team1ID}{Team2ID}
-    test_data = []
-    
-    for id_val in sample_submission['ID']:
-        # Convert to string and extract components
-        id_str = str(int(id_val))
-        
-        # Extract season and team IDs (adjust parsing logic as needed)
-        if len(id_str) >= 11:  # Ensure ID is long enough
-            season = int(id_str[:4])
-            team1 = int(id_str[4:8])
-            team2 = int(id_str[8:])
-            
-            # Determine higher and lower seed teams
-            higher_team = max(team1, team2)
-            lower_team = min(team1, team2)
-            
-            # Create basic features (expand as needed)
-            features = {
-                'ID': id_val,
-                'ScoreDiff': 0,  # Placeholder
-                'TotalScore': 0,  # Placeholder
-                'WLoc': 0.5,  # Neutral location for tournament games
-                'NumOT': 0,  # Placeholder
-                # Add more features as needed, matching the training data structure
-                # Use average values or other reasonable defaults
-            }
-            
-            test_data.append(features)
-    
-    # Convert to dataframe
-    test_df = pd.DataFrame(test_data)
-    
-    # Save the prepared data
-    test_file = os.path.join(cleaned_folder, 'test_data_enhanced.csv')
-    test_df.to_csv(test_file, index=False)
-    print(f"Test data saved to {test_file}")
-    
-    return test_df
-
-def create_submission_file(model, submission_template_path, submission_filename, cleaned_folder=None):
-    """Create submission file for the competition"""
-    print(f"Creating submission file using template: {submission_template_path}")
-    
-    # Load the sample submission file
-    sample_submission = pd.read_csv(submission_template_path)
-    
-    # Check if test data is available
-    test_file = os.path.join(cleaned_folder, 'test_data_enhanced.csv') if cleaned_folder else None
-    
-    if os.path.exists(test_file):
-        # Load test data
-        print(f"Loading test data from {test_file}")
-        test_df = pd.read_csv(test_file)
-        # Prepare test features (adjust as needed)
-        X_test_submission = test_df.drop(columns=['ID'])
-        # Generate predictions
-        preds = model.predict_proba(X_test_submission)[:, 1]
-        sample_submission['Pred'] = preds
-    else:
-        # If test data is not available, prepare it
-        print(f"Test data not found at {test_file}. Preparing test data...")
-        try:
-            test_df = prepare_test_data(cleaned_folder, sample_submission)
-            X_test_submission = test_df.drop(columns=['ID'])
-            preds = model.predict_proba(X_test_submission)[:, 1]
-            sample_submission['Pred'] = preds
-        except Exception as e:
-            print(f"Error preparing test data: {e}")
-            print("Using default predictions (0.5)")
-            sample_submission['Pred'] = 0.5
-    
-    # Save the submission file
-    sample_submission.to_csv(submission_filename, index=False)
-    print(f'Submission file created as {submission_filename}')
-    print(sample_submission.head())
-
-def main():
-    """Main function to run the entire pipeline"""
-    print("Starting March Madness prediction pipeline...")
-    
-    # Set file and folder paths. In Kaggle, adjust input paths as needed.
-    base_path = '../input/march-machine-learning-mania-2025'
-    if not os.path.exists(base_path):
-        # If not running on Kaggle, use local paths
-        base_path = '.'
-        print(f"Using local path: {base_path}")
-    else:
-        print(f"Using Kaggle path: {base_path}")
-    
-    # List files in the base path
-    print(f"Files in {base_path}:")
-    if os.path.exists(base_path):
-        print(os.listdir(base_path))
-    
-    zip_file_path = os.path.join(base_path, 'march-machine-learning-mania-2025.zip')
-    cleaned_folder = 'march-madness-2025-cleaned'
-    
-    # Check if extraction is needed
-    if not os.path.exists(cleaned_folder):
-        if os.path.exists(zip_file_path):
-            print(f"Extracting data from {zip_file_path}...")
-            extract_data(zip_file_path, cleaned_folder)
-        else:
-            # If zip file doesn't exist, check if individual files are directly available
-            print(f"Zip file {zip_file_path} not found. Checking for direct file access...")
-            cleaned_folder = base_path
-    
-    # Load and prepare data
-    try:
-        X, y = load_and_prepare_data(cleaned_folder)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        # Train model
-        model = train_model(X_train, y_train)
-        
-        # Evaluate model
-        evaluate_model(model, X_test, y_test)
-        
-        # Create submission file
-        submission_template_path = os.path.join(base_path, 'SampleSubmissionStage2.csv')
-        if not os.path.exists(submission_template_path):
-            # Try to find the sample submission file
-            for root, dirs, files in os.walk(base_path):
-                for file in files:
-                    if 'samplesubmission' in file.lower() and 'stage2' in file.lower():
-                        submission_template_path = os.path.join(root, file)
-                        break
-        
-        if not os.path.exists(submission_template_path):
-            submission_template_path = 'SampleSubmissionStage2.csv'
-        
-        submission_filename = 'submission.csv'
-        create_submission_file(model, submission_template_path, submission_filename, cleaned_folder)
-        
-    except Exception as e:
-        print(f"Error in pipeline: {e}")
-        # Create a simple submission with default values
-        try:
-            submission_template_path = os.path.join(base_path, 'SampleSubmissionStage2.csv')
-            if not os.path.exists(submission_template_path):
-                for root, dirs, files in os.walk(base_path):
-                    for file in files:
-                        if 'samplesubmission' in file.lower():
-                            submission_template_path = os.path.join(root, file)
-                            break
-            
-            if os.path.exists(submission_template_path):
-                print(f"Creating default submission using template: {submission_template_path}")
-                sample_submission = pd.read_csv(submission_template_path)
-                sample_submission['Pred'] = 0.5
-                submission_filename = 'submission.csv'
-                sample_submission.to_csv(submission_filename, index=False)
-                print(f'Default submission file created as {submission_filename}')
-                print(sample_submission.head())
-            else:
-                print("Could not find sample submission template")
-        except Exception as sub_error:
-            print(f"Error creating default submission: {sub_error}")
-
-if __name__ == '__main__':
-    main()
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "05e76cae",
+   "metadata": {
+    "_cell_guid": "489a6fbf-de99-4d9e-a687-6e0ec7ef0553",
+    "_uuid": "20fab277-498d-4252-9193-d61b043d500d",
+    "collapsed": false,
+    "execution": {
+     "iopub.execute_input": "2025-03-20T05:30:16.063921Z",
+     "iopub.status.busy": "2025-03-20T05:30:16.063570Z",
+     "iopub.status.idle": "2025-03-20T05:30:22.838471Z",
+     "shell.execute_reply": "2025-03-20T05:30:22.836963Z"
+    },
+    "jupyter": {
+     "outputs_hidden": false
+    },
+    "papermill": {
+     "duration": 6.780455,
+     "end_time": "2025-03-20T05:30:22.840270",
+     "exception": false,
+     "start_time": "2025-03-20T05:30:16.059815",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Starting March Madness prediction pipeline...\n",
+      "Using Kaggle path: ../input/march-machine-learning-mania-2025\n",
+      "Files in ../input/march-machine-learning-mania-2025:\n",
+      "['Conferences.csv', 'SeedBenchmarkStage1.csv', 'WNCAATourneyDetailedResults.csv', 'WRegularSeasonCompactResults.csv', 'MNCAATourneySeedRoundSlots.csv', 'MRegularSeasonDetailedResults.csv', 'MNCAATourneyCompactResults.csv', 'MGameCities.csv', 'WSecondaryTourneyCompactResults.csv', 'WGameCities.csv', 'MSeasons.csv', 'WNCAATourneySlots.csv', 'MSecondaryTourneyTeams.csv', 'SampleSubmissionStage2.csv', 'Cities.csv', 'MTeamSpellings.csv', 'MRegularSeasonCompactResults.csv', 'MMasseyOrdinals.csv', 'MSecondaryTourneyCompactResults.csv', 'WTeams.csv', 'WConferenceTourneyGames.csv', 'MNCAATourneySlots.csv', 'MNCAATourneySeeds.csv', 'WNCAATourneyCompactResults.csv', 'WSeasons.csv', 'WNCAATourneySeeds.csv', 'MTeamCoaches.csv', 'MConferenceTourneyGames.csv', 'WRegularSeasonDetailedResults.csv', 'MNCAATourneyDetailedResults.csv', 'WTeamSpellings.csv', 'MTeamConferences.csv', 'MTeams.csv', 'WTeamConferences.csv', 'SampleSubmissionStage1.csv', 'WSecondaryTourneyTeams.csv']\n",
+      "Zip file ../input/march-machine-learning-mania-2025/march-machine-learning-mania-2025.zip not found. Checking for direct file access...\n",
+      "Preprocessed file ../input/march-machine-learning-mania-2025/train_data_enhanced.csv not found. Preparing from raw data...\n",
+      "Preparing training data from raw files...\n",
+      "Creating features for each game...\n",
+      "Error in pipeline: [Errno 30] Read-only file system: '../input/march-machine-learning-mania-2025/train_data_enhanced.csv'\n",
+      "Creating default submission using template: ../input/march-machine-learning-mania-2025/SampleSubmissionStage2.csv\n",
+      "Default submission file created as submission.csv\n",
+      "               ID  Pred\n",
+      "0  2025_1101_1102   0.5\n",
+      "1  2025_1101_1103   0.5\n",
+      "2  2025_1101_1104   0.5\n",
+      "3  2025_1101_1105   0.5\n",
+      "4  2025_1101_1106   0.5\n"
+     ]
+    }
+   ],
+   "source": [
+    "import os\n",
+    "import zipfile\n",
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, StackingClassifier\n",
+    "from sklearn.linear_model import LogisticRegression\n",
+    "from sklearn.metrics import accuracy_score, log_loss, roc_auc_score, confusion_matrix, classification_report, brier_score_loss\n",
+    "import xgboost as xgb\n",
+    "import lightgbm as lgb\n",
+    "\n",
+    "def extract_data(zip_file_path, extract_folder):\n",
+    "    \"\"\"Extract data from zip file to folder\"\"\"\n",
+    "    # Create folder if not exists\n",
+    "    if not os.path.exists(extract_folder):\n",
+    "        os.makedirs(extract_folder)\n",
+    "    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:\n",
+    "        zip_ref.extractall(extract_folder)\n",
+    "    print('Extracted files from ' + zip_file_path)\n",
+    "\n",
+    "def prepare_training_data(cleaned_folder):\n",
+    "    \"\"\"Prepare training data from raw files\"\"\"\n",
+    "    print(\"Preparing training data from raw files...\")\n",
+    "    \n",
+    "    # Paths for men's tournament results and teams\n",
+    "    men_results_path = os.path.join(cleaned_folder, 'MNCAATourneyDetailedResults.csv')\n",
+    "    men_teams_path = os.path.join(cleaned_folder, 'MTeams.csv')\n",
+    "    \n",
+    "    # Check if files exist\n",
+    "    if not os.path.exists(men_results_path) or not os.path.exists(men_teams_path):\n",
+    "        print(f\"Required files not found. Checking contents of {cleaned_folder}:\")\n",
+    "        if os.path.exists(cleaned_folder):\n",
+    "            print(os.listdir(cleaned_folder))\n",
+    "        else:\n",
+    "            print(f\"{cleaned_folder} directory does not exist\")\n",
+    "        raise FileNotFoundError(f\"Required files not found in {cleaned_folder}\")\n",
+    "    \n",
+    "    # Load tournament results and teams\n",
+    "    results_df = pd.read_csv(men_results_path)\n",
+    "    teams_df = pd.read_csv(men_teams_path)\n",
+    "    \n",
+    "    # Create features for each game\n",
+    "    print(\"Creating features for each game...\")\n",
+    "    \n",
+    "    # Initialize an empty dataframe for training data\n",
+    "    train_data = []\n",
+    "    \n",
+    "    # Process each game\n",
+    "    for _, row in results_df.iterrows():\n",
+    "        season = row['Season']\n",
+    "        wteam = row['WTeamID']\n",
+    "        lteam = row['LTeamID']\n",
+    "        \n",
+    "        # Determine higher and lower seed teams (using team ID as proxy if seed info not available)\n",
+    "        higher_team = max(wteam, lteam)\n",
+    "        lower_team = min(wteam, lteam)\n",
+    "        \n",
+    "        # Create features (simplified example - expand as needed)\n",
+    "        features = {\n",
+    "            'Season': season,\n",
+    "            'HigherTeamID': higher_team,\n",
+    "            'LowerTeamID': lower_team,\n",
+    "            'Tournament': 1,  # 1 for tournament games\n",
+    "            'ScoreDiff': abs(row['WScore'] - row['LScore']),\n",
+    "            'TotalScore': row['WScore'] + row['LScore'],\n",
+    "            'WLoc': 1 if row['WLoc'] == 'H' else (0 if row['WLoc'] == 'A' else 0.5),  # Home/Away/Neutral\n",
+    "            'NumOT': row['NumOT'],\n",
+    "            'WFGM': row['WFGM'],\n",
+    "            'WFGA': row['WFGA'],\n",
+    "            'WFGM3': row['WFGM3'],\n",
+    "            'WFGA3': row['WFGA3'],\n",
+    "            'WFTM': row['WFTM'],\n",
+    "            'WFTA': row['WFTA'],\n",
+    "            'WOR': row['WOR'],\n",
+    "            'WDR': row['WDR'],\n",
+    "            'WAst': row['WAst'],\n",
+    "            'WTO': row['WTO'],\n",
+    "            'WStl': row['WStl'],\n",
+    "            'WBlk': row['WBlk'],\n",
+    "            'WPF': row['WPF'],\n",
+    "            'LFGM': row['LFGM'],\n",
+    "            'LFGA': row['LFGA'],\n",
+    "            'LFGM3': row['LFGM3'],\n",
+    "            'LFGA3': row['LFGA3'],\n",
+    "            'LFTM': row['LFTM'],\n",
+    "            'LFTA': row['LFTA'],\n",
+    "            'LOR': row['LOR'],\n",
+    "            'LDR': row['LDR'],\n",
+    "            'LAst': row['LAst'],\n",
+    "            'LTO': row['LTO'],\n",
+    "            'LStl': row['LStl'],\n",
+    "            'LBlk': row['LBlk'],\n",
+    "            'LPF': row['LPF'],\n",
+    "            'Target': 1 if wteam == higher_team else 0  # 1 if higher seed team won, 0 otherwise\n",
+    "        }\n",
+    "        \n",
+    "        train_data.append(features)\n",
+    "    \n",
+    "    # Convert to dataframe\n",
+    "    train_df = pd.DataFrame(train_data)\n",
+    "    \n",
+    "    # Save the prepared data\n",
+    "    train_file = os.path.join(cleaned_folder, 'train_data_enhanced.csv')\n",
+    "    train_df.to_csv(train_file, index=False)\n",
+    "    print(f\"Training data saved to {train_file}\")\n",
+    "    \n",
+    "    return train_df\n",
+    "\n",
+    "def load_and_prepare_data(cleaned_folder):\n",
+    "    \"\"\"Load and prepare data for training\"\"\"\n",
+    "    # Try to load the preprocessed file\n",
+    "    train_file = os.path.join(cleaned_folder, 'train_data_enhanced.csv')\n",
+    "    \n",
+    "    if os.path.exists(train_file):\n",
+    "        print(f\"Loading preprocessed training data from {train_file}\")\n",
+    "        df = pd.read_csv(train_file)\n",
+    "    else:\n",
+    "        print(f\"Preprocessed file {train_file} not found. Preparing from raw data...\")\n",
+    "        df = prepare_training_data(cleaned_folder)\n",
+    "    \n",
+    "    # Create features and target\n",
+    "    X = df.drop(columns=['Season', 'LowerTeamID', 'HigherTeamID', 'Tournament', 'Target'])\n",
+    "    y = df['Target']\n",
+    "    return X, y\n",
+    "\n",
+    "def train_model(X_train, y_train):\n",
+    "    \"\"\"Train a stacking ensemble model\"\"\"\n",
+    "    print(\"Training stacking ensemble model...\")\n",
+    "    # Define base models\n",
+    "    estimators = [\n",
+    "        ('gb', GradientBoostingClassifier(random_state=42)),\n",
+    "        ('rf', RandomForestClassifier(random_state=42)),\n",
+    "        ('xgb', xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss')),\n",
+    "        ('lgb', lgb.LGBMClassifier(random_state=42))\n",
+    "    ]\n",
+    "    \n",
+    "    # Define meta-model\n",
+    "    meta_model = LogisticRegression(max_iter=1000, random_state=42)\n",
+    "    \n",
+    "    # Create Stacking ensemble\n",
+    "    stack_model = StackingClassifier(estimators=estimators, final_estimator=meta_model, cv=5, passthrough=False)\n",
+    "    \n",
+    "    # Train the stacking model\n",
+    "    stack_model.fit(X_train, y_train)\n",
+    "    print(\"Model training complete\")\n",
+    "    \n",
+    "    return stack_model\n",
+    "\n",
+    "def evaluate_model(model, X_test, y_test):\n",
+    "    \"\"\"Evaluate the model on test data\"\"\"\n",
+    "    print(\"Evaluating model on test data...\")\n",
+    "    # Predict on test set\n",
+    "    pred_proba = model.predict_proba(X_test)[:, 1]\n",
+    "    pred = model.predict(X_test)\n",
+    "    \n",
+    "    # Evaluate the model\n",
+    "    acc = accuracy_score(y_test, pred)\n",
+    "    ll = log_loss(y_test, pred_proba)\n",
+    "    roc = roc_auc_score(y_test, pred_proba)\n",
+    "    gini = 2 * roc - 1\n",
+    "    brier = brier_score_loss(y_test, pred_proba)\n",
+    "    \n",
+    "    print('--- Enhanced Stacking Ensemble Evaluation ---')\n",
+    "    print('Accuracy:', acc)\n",
+    "    print('Log Loss:', ll)\n",
+    "    print('ROC AUC:', roc)\n",
+    "    print('Gini Coefficient:', gini)\n",
+    "    print('Brier Score:', brier)\n",
+    "    print('Confusion Matrix:\\n', confusion_matrix(y_test, pred))\n",
+    "    print('Classification Report:\\n', classification_report(y_test, pred))\n",
+    "\n",
+    "def prepare_test_data(cleaned_folder, sample_submission):\n",
+    "    \"\"\"Prepare test data from sample submission IDs\"\"\"\n",
+    "    print(\"Preparing test data from sample submission IDs...\")\n",
+    "    \n",
+    "    # Extract information from sample submission IDs\n",
+    "    # Format is assumed to be: {Season}{Team1ID}{Team2ID}\n",
+    "    test_data = []\n",
+    "    \n",
+    "    for id_val in sample_submission['ID']:\n",
+    "        # Convert to string and extract components\n",
+    "        id_str = str(int(id_val))\n",
+    "        \n",
+    "        # Extract season and team IDs (adjust parsing logic as needed)\n",
+    "        if len(id_str) >= 11:  # Ensure ID is long enough\n",
+    "            season = int(id_str[:4])\n",
+    "            team1 = int(id_str[4:8])\n",
+    "            team2 = int(id_str[8:])\n",
+    "            \n",
+    "            # Determine higher and lower seed teams\n",
+    "            higher_team = max(team1, team2)\n",
+    "            lower_team = min(team1, team2)\n",
+    "            \n",
+    "            # Create basic features (expand as needed)\n",
+    "            features = {\n",
+    "                'ID': id_val,\n",
+    "                'ScoreDiff': 0,  # Placeholder\n",
+    "                'TotalScore': 0,  # Placeholder\n",
+    "                'WLoc': 0.5,  # Neutral location for tournament games\n",
+    "                'NumOT': 0,  # Placeholder\n",
+    "                # Add more features as needed, matching the training data structure\n",
+    "                # Use average values or other reasonable defaults\n",
+    "            }\n",
+    "            \n",
+    "            test_data.append(features)\n",
+    "    \n",
+    "    # Convert to dataframe\n",
+    "    test_df = pd.DataFrame(test_data)\n",
+    "    \n",
+    "    # Save the prepared data\n",
+    "    test_file = os.path.join(cleaned_folder, 'test_data_enhanced.csv')\n",
+    "    test_df.to_csv(test_file, index=False)\n",
+    "    print(f\"Test data saved to {test_file}\")\n",
+    "    \n",
+    "    return test_df\n",
+    "\n",
+    "def create_submission_file(model, submission_template_path, submission_filename, cleaned_folder=None):\n",
+    "    \"\"\"Create submission file for the competition\"\"\"\n",
+    "    print(f\"Creating submission file using template: {submission_template_path}\")\n",
+    "    \n",
+    "    # Load the sample submission file\n",
+    "    sample_submission = pd.read_csv(submission_template_path)\n",
+    "    \n",
+    "    # Check if test data is available\n",
+    "    test_file = os.path.join(cleaned_folder, 'test_data_enhanced.csv') if cleaned_folder else None\n",
+    "    \n",
+    "    if os.path.exists(test_file):\n",
+    "        # Load test data\n",
+    "        print(f\"Loading test data from {test_file}\")\n",
+    "        test_df = pd.read_csv(test_file)\n",
+    "        # Prepare test features (adjust as needed)\n",
+    "        X_test_submission = test_df.drop(columns=['ID'])\n",
+    "        # Generate predictions\n",
+    "        preds = model.predict_proba(X_test_submission)[:, 1]\n",
+    "        sample_submission['Pred'] = preds\n",
+    "    else:\n",
+    "        # If test data is not available, prepare it\n",
+    "        print(f\"Test data not found at {test_file}. Preparing test data...\")\n",
+    "        try:\n",
+    "            test_df = prepare_test_data(cleaned_folder, sample_submission)\n",
+    "            X_test_submission = test_df.drop(columns=['ID'])\n",
+    "            preds = model.predict_proba(X_test_submission)[:, 1]\n",
+    "            sample_submission['Pred'] = preds\n",
+    "        except Exception as e:\n",
+    "            print(f\"Error preparing test data: {e}\")\n",
+    "            print(\"Using default predictions (0.5)\")\n",
+    "            sample_submission['Pred'] = 0.5\n",
+    "    \n",
+    "    # Save the submission file\n",
+    "    sample_submission.to_csv(submission_filename, index=False)\n",
+    "    print(f'Submission file created as {submission_filename}')\n",
+    "    print(sample_submission.head())\n",
+    "\n",
+    "def main():\n",
+    "    \"\"\"Main function to run the entire pipeline\"\"\"\n",
+    "    print(\"Starting March Madness prediction pipeline...\")\n",
+    "    \n",
+    "    # Set file and folder paths. In Kaggle, adjust input paths as needed.\n",
+    "    base_path = '../input/march-machine-learning-mania-2025'\n",
+    "    if not os.path.exists(base_path):\n",
+    "        # If not running on Kaggle, use local paths\n",
+    "        base_path = '.'\n",
+    "        print(f\"Using local path: {base_path}\")\n",
+    "    else:\n",
+    "        print(f\"Using Kaggle path: {base_path}\")\n",
+    "    \n",
+    "    # List files in the base path\n",
+    "    print(f\"Files in {base_path}:\")\n",
+    "    if os.path.exists(base_path):\n",
+    "        print(os.listdir(base_path))\n",
+    "    \n",
+    "    zip_file_path = os.path.join(base_path, 'march-machine-learning-mania-2025.zip')\n",
+    "    cleaned_folder = 'march-madness-2025-cleaned'\n",
+    "    \n",
+    "    # Check if extraction is needed\n",
+    "    if not os.path.exists(cleaned_folder):\n",
+    "        if os.path.exists(zip_file_path):\n",
+    "            print(f\"Extracting data from {zip_file_path}...\")\n",
+    "            extract_data(zip_file_path, cleaned_folder)\n",
+    "        else:\n",
+    "            # If zip file doesn't exist, check if individual files are directly available\n",
+    "            print(f\"Zip file {zip_file_path} not found. Checking for direct file access...\")\n",
+    "            cleaned_folder = base_path\n",
+    "    \n",
+    "    # Load and prepare data\n",
+    "    try:\n",
+    "        X, y = load_and_prepare_data(cleaned_folder)\n",
+    "        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)\n",
+    "        \n",
+    "        # Train model\n",
+    "        model = train_model(X_train, y_train)\n",
+    "        \n",
+    "        # Evaluate model\n",
+    "        evaluate_model(model, X_test, y_test)\n",
+    "        \n",
+    "        # Create submission file\n",
+    "        submission_template_path = os.path.join(base_path, 'SampleSubmissionStage2.csv')\n",
+    "        if not os.path.exists(submission_template_path):\n",
+    "            # Try to find the sample submission file\n",
+    "            for root, dirs, files in os.walk(base_path):\n",
+    "                for file in files:\n",
+    "                    if 'samplesubmission' in file.lower() and 'stage2' in file.lower():\n",
+    "                        submission_template_path = os.path.join(root, file)\n",
+    "                        break\n",
+    "        \n",
+    "        if not os.path.exists(submission_template_path):\n",
+    "            submission_template_path = 'SampleSubmissionStage2.csv'\n",
+    "        \n",
+    "        submission_filename = 'submission.csv'\n",
+    "        create_submission_file(model, submission_template_path, submission_filename, cleaned_folder)\n",
+    "        \n",
+    "    except Exception as e:\n",
+    "        print(f\"Error in pipeline: {e}\")\n",
+    "        # Create a simple submission with default values\n",
+    "        try:\n",
+    "            submission_template_path = os.path.join(base_path, 'SampleSubmissionStage2.csv')\n",
+    "            if not os.path.exists(submission_template_path):\n",
+    "                for root, dirs, files in os.walk(base_path):\n",
+    "                    for file in files:\n",
+    "                        if 'samplesubmission' in file.lower():\n",
+    "                            submission_template_path = os.path.join(root, file)\n",
+    "                            break\n",
+    "            \n",
+    "            if os.path.exists(submission_template_path):\n",
+    "                print(f\"Creating default submission using template: {submission_template_path}\")\n",
+    "                sample_submission = pd.read_csv(submission_template_path)\n",
+    "                sample_submission['Pred'] = 0.5\n",
+    "                submission_filename = 'submission.csv'\n",
+    "                sample_submission.to_csv(submission_filename, index=False)\n",
+    "                print(f'Default submission file created as {submission_filename}')\n",
+    "                print(sample_submission.head())\n",
+    "            else:\n",
+    "                print(\"Could not find sample submission template\")\n",
+    "        except Exception as sub_error:\n",
+    "            print(f\"Error creating default submission: {sub_error}\")\n",
+    "\n",
+    "if __name__ == '__main__':\n",
+    "    main()"
+   ]
+  }
+ ],
+ "metadata": {
+  "kaggle": {
+   "accelerator": "none",
+   "dataSources": [
+    {
+     "databundleVersionId": 11484718,
+     "sourceId": 91497,
+     "sourceType": "competition"
+    }
+   ],
+   "dockerImageVersionId": 30918,
+   "isGpuEnabled": false,
+   "isInternetEnabled": true,
+   "language": "python",
+   "sourceType": "notebook"
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.12"
+  },
+  "papermill": {
+   "default_parameters": {},
+   "duration": 10.468535,
+   "end_time": "2025-03-20T05:30:23.763661",
+   "environment_variables": {},
+   "exception": null,
+   "input_path": "__notebook__.ipynb",
+   "output_path": "__notebook__.ipynb",
+   "parameters": {},
+   "start_time": "2025-03-20T05:30:13.295126",
+   "version": "2.6.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
